@@ -316,6 +316,15 @@ extract_block() {
     ' "$1"
 }
 
+extract_function() {
+    # extract_function <file> <function-name> -> the function source
+    awk -v fn="$2" '
+        $0 ~ "^" fn "\\(\\) \\{" { grab = 1 }
+        grab { print }
+        grab && /^}/ { exit }
+    ' "$1"
+}
+
 if extract_block bootstrap/bootstrap.sh "/usr/local/sbin/hub-reboot-if-stale <<'EOF'" >"$WORK/hub-reboot-if-stale"; then
     pass "extracted hub-reboot-if-stale from bootstrap.sh"
 else
@@ -379,10 +388,25 @@ chmod +x "$WORK/hub-heartbeat"
 mkdir -p "$WORK/fakebin"
 cat >"$WORK/fakebin/tailscale" <<'EOF'
 #!/usr/bin/env bash
-if [ "${FAKE_TAILSCALE_FAIL:-0}" = "1" ]; then
-    exit 1
-fi
-echo "100.64.0.1"
+case "${1:-}" in
+    status)
+        if [ "${FAKE_TAILSCALE_FAIL:-0}" = "1" ]; then
+            echo "failed to connect to local tailscaled" >&2
+            exit 1
+        fi
+        json="${FAKE_TS_BACKEND_JSON:-}"
+        if [ -z "$json" ]; then
+            json='{"BackendState":"Running"}'
+        fi
+        printf '%s\n' "$json"
+        exit 0
+        ;;
+    ip)
+        echo "100.64.0.1"
+        exit 0
+        ;;
+esac
+exit 0
 EOF
 cat >"$WORK/fakebin/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -399,17 +423,27 @@ export FAKE_CURL_LOG="$WORK/curl.log"
 : >"$FAKE_CURL_LOG"
 out="$(PATH="$WORK/fakebin:$PATH" HC_URL="https://hc.example.com/abc" "$WORK/hub-heartbeat" 2>&1 || true)"
 if grep -q '^https://hc.example.com/abc$' "$FAKE_CURL_LOG"; then
-    pass "hub-heartbeat: pings HC_URL when tailscale has an address"
+    pass "hub-heartbeat: pings HC_URL when tailscale reports BackendState Running"
 else
-    fail "hub-heartbeat: pings HC_URL when tailscale has an address (log: $(cat "$FAKE_CURL_LOG"))"
+    fail "hub-heartbeat: pings HC_URL when tailscale reports BackendState Running (log: $(cat "$FAKE_CURL_LOG"))"
 fi
 
 : >"$FAKE_CURL_LOG"
-out="$(PATH="$WORK/fakebin:$PATH" FAKE_TAILSCALE_FAIL=1 HC_URL="https://hc.example.com/abc" "$WORK/hub-heartbeat" 2>&1 || true)"
+out="$(PATH="$WORK/fakebin:$PATH" FAKE_TS_BACKEND_JSON='{"BackendState":"Stopped"}' \
+    HC_URL="https://hc.example.com/abc" "$WORK/hub-heartbeat" 2>&1 || true)"
 if grep -q '^https://hc.example.com/abc/fail$' "$FAKE_CURL_LOG"; then
-    pass "hub-heartbeat: pings HC_URL/fail when tailscale has no address"
+    pass "hub-heartbeat: pings HC_URL/fail when BackendState is not Running"
 else
-    fail "hub-heartbeat: pings HC_URL/fail when tailscale has no address (log: $(cat "$FAKE_CURL_LOG"))"
+    fail "hub-heartbeat: pings HC_URL/fail when BackendState is not Running (log: $(cat "$FAKE_CURL_LOG"))"
+fi
+
+: >"$FAKE_CURL_LOG"
+out="$(PATH="$WORK/fakebin:$PATH" FAKE_TAILSCALE_FAIL=1 \
+    HC_URL="https://hc.example.com/abc" "$WORK/hub-heartbeat" 2>&1 || true)"
+if grep -q '^https://hc.example.com/abc/fail$' "$FAKE_CURL_LOG"; then
+    pass "hub-heartbeat: pings HC_URL/fail when tailscale status fails"
+else
+    fail "hub-heartbeat: pings HC_URL/fail when tailscale status fails (log: $(cat "$FAKE_CURL_LOG"))"
 fi
 
 : >"$FAKE_CURL_LOG"
@@ -572,6 +606,49 @@ for unit in "$WORK/units"/*; do
     fi
 done
 
+# --- 5c-2. the units the kit enables must actually be installable ----------
+# systemctl enable exits 0 even for a unit WITHOUT an [Install] section (it
+# only prints "The unit files have no installation config"), so the symlink
+# in the target's .wants directory is the real proof that the unit can be
+# enabled at all.
+install -d -m 0755 "$WORK/sysroot/etc/systemd/system"
+for unit in hub-power-restore.service hub-battery-limit.service hub-epp.service; do
+    if [ ! -f "$WORK/units/$unit" ]; then
+        fail "$unit was not extracted from the kit"
+        continue
+    fi
+    rm -rf "$WORK/sysroot/etc/systemd/system/multi-user.target.wants"
+    cp "$WORK/units/$unit" "$WORK/sysroot/etc/systemd/system/"
+    if systemctl --root="$WORK/sysroot" enable "$unit" >"$WORK/enable.out" 2>&1 &&
+        [ -L "$WORK/sysroot/etc/systemd/system/multi-user.target.wants/$unit" ]; then
+        pass "systemctl enable $unit wires it into multi-user.target"
+    else
+        fail "systemctl enable did not wire $unit into multi-user.target"
+        sed 's/^/      /' "$WORK/enable.out" | head -6
+    fi
+done
+
+# Static check: every unit the kit ships AND enables must carry an [Install]
+# section, otherwise "systemctl enable" silently does nothing.
+kit_enabled_units() {
+    grep -hoE 'systemctl[[:space:]]+enable([[:space:]]+--now)?[[:space:]]+[A-Za-z0-9_.@-]+\.(service|timer)' \
+        bootstrap/bootstrap.sh bootstrap/optional/*.sh \
+        | grep -oE '[A-Za-z0-9_.@-]+\.(service|timer)$' | sort -u
+}
+missing_install=""
+for unit in $(kit_enabled_units); do
+    base="$(basename "$unit")"
+    [ -f "$WORK/units/$base" ] || continue
+    if ! grep -q '^\[Install\]' "$WORK/units/$base"; then
+        missing_install="$missing_install $base"
+    fi
+done
+if [ -z "$missing_install" ]; then
+    pass "every unit the kit enables has an [Install] section"
+else
+    fail "these units are enabled by the kit but have no [Install] section:$missing_install"
+fi
+
 # --- 5d. JSON -------------------------------------------------------------
 if jq -e . policy/tailscale-policy-snippet.json >/dev/null 2>&1; then
     pass "the tailscale policy snippet is valid JSON"
@@ -592,12 +669,13 @@ fi
 
 # --- 5e. needrestart -----------------------------------------------------
 if command -v needrestart >/dev/null 2>&1; then
-    extract_block bootstrap/bootstrap.sh "/etc/needrestart/needrestart.conf <<'EOF'" \
+    extract_block bootstrap/bootstrap.sh "/etc/needrestart/conf.d/50-hub.conf <<'EOF'" \
         >"$WORK/needrestart.conf"
     if [ -s "$WORK/needrestart.conf" ]; then
         pass "extracted the needrestart config from bootstrap.sh"
-        cp "$WORK/needrestart.conf" /etc/needrestart/needrestart.conf
-        if perl -c /etc/needrestart/needrestart.conf >"$WORK/nr.out" 2>&1; then
+        install -d -m 0755 /etc/needrestart/conf.d
+        cp "$WORK/needrestart.conf" /etc/needrestart/conf.d/50-hub.conf
+        if perl -c /etc/needrestart/conf.d/50-hub.conf >"$WORK/nr.out" 2>&1; then
             pass "the needrestart config is valid perl"
         else
             fail "the needrestart config is not valid perl"
@@ -623,7 +701,76 @@ else
     printf 'SKIP  needrestart is not installed in this image\n'
 fi
 
-# --- 5f. the zram-generator expression ------------------------------------
+# The kit must not overwrite the distribution's main needrestart.conf - its
+# settings belong in the drop-in directory.
+if grep -qE 'write_root_file [0-9]+ /etc/needrestart/needrestart\.conf' bootstrap/bootstrap.sh ||
+    grep -qF "/etc/needrestart/needrestart.conf <<'EOF'" bootstrap/bootstrap.sh; then
+    fail "the kit still overwrites /etc/needrestart/needrestart.conf"
+else
+    pass "the kit does not overwrite /etc/needrestart/needrestart.conf"
+fi
+if grep -qE 'install -d .* /etc/needrestart/conf\.d' bootstrap/bootstrap.sh; then
+    pass "the kit creates /etc/needrestart/conf.d"
+else
+    fail "the kit does not create /etc/needrestart/conf.d"
+fi
+
+# The battery unit must only run when the kernel exposes the threshold file.
+if grep -q '^ConditionPathExists=.*charge_control_end_threshold' \
+    "$WORK/units/hub-battery-limit.service"; then
+    pass "hub-battery-limit.service only runs when the charge threshold file exists"
+else
+    fail "hub-battery-limit.service has no ConditionPathExists for the charge threshold file"
+fi
+
+# --- 5f. the documented run command ---------------------------------------
+# The bootstrap runs as the normal user with the secrets in the environment.
+# It must never be documented as "sudo ... bootstrap/bootstrap.sh", and the
+# "sudo --preserve-env" form belongs to the optional modules only.
+for doc in README.md RUNBOOK.md; do
+    if grep -q 'UBUNTU_PRO_TOKEN=' "$doc" &&
+        grep -q 'TS_TAG=tag:hub' "$doc" &&
+        grep -q 'bash bootstrap/bootstrap\.sh' "$doc"; then
+        pass "$doc documents the bootstrap with the environment variables"
+    else
+        fail "$doc does not document the bootstrap with the environment variables"
+    fi
+    # a line that says "never run it with sudo" is not an instruction to do so
+    sudo_lines="$(grep -nE 'sudo[^|;&]*bootstrap/bootstrap\.sh' "$doc" | grep -viE 'never|not |don.t' || true)"
+    if [ -n "$sudo_lines" ]; then
+        fail "$doc tells the user to run the bootstrap with sudo"
+        printf '%s\n' "$sudo_lines" | head -5 | sed 's/^/      /'
+    else
+        pass "$doc does not tell the user to run the bootstrap with sudo"
+    fi
+    pe_lines="$(grep -nE 'sudo --preserve-env[^|;&]*bootstrap/bootstrap\.sh' "$doc" | grep -viE 'never|not |don.t' || true)"
+    if [ -n "$pe_lines" ]; then
+        fail "$doc still uses sudo --preserve-env for the bootstrap"
+        printf '%s\n' "$pe_lines" | head -5 | sed 's/^/      /'
+    else
+        pass "$doc does not use sudo --preserve-env for the bootstrap"
+    fi
+done
+if grep -q 'sudo --preserve-env=WIFI_SSID,WIFI_PASS' README.md &&
+    grep -q '/etc/hub/optional.env' README.md; then
+    pass "README keeps the sudo --preserve-env form for the optional modules"
+else
+    fail "README lost the optional-module form"
+fi
+extract_function bootstrap/bootstrap.sh banner >"$WORK/banner"
+if grep -q 'UBUNTU_PRO_TOKEN=' "$WORK/banner" &&
+    grep -q 'bash bootstrap/bootstrap\.sh' "$WORK/banner"; then
+    pass "the final banner documents the bootstrap with the environment variables"
+else
+    fail "the final banner does not document the bootstrap with the environment variables"
+fi
+if grep -q 'sudo --preserve-env' "$WORK/banner"; then
+    fail "the final banner still uses sudo --preserve-env"
+else
+    pass "the final banner does not use sudo --preserve-env"
+fi
+
+# --- 5g. the zram-generator expression ------------------------------------
 ZRAM_GEN="/usr/lib/systemd/system-generators/zram-generator"
 if [ -x "$ZRAM_GEN" ]; then
     install -d -m 0755 /etc/systemd
@@ -653,10 +800,300 @@ else
     printf 'SKIP  zram-generator is not installed in this image\n'
 fi
 
+# --- 5h. the power-restore helper (fake setpci) ---------------------------
+extract_block bootstrap/bootstrap.sh "/usr/local/sbin/hub-power-restore <<'EOF'" \
+    >"$WORK/hub-power-restore"
+if [ -s "$WORK/hub-power-restore" ]; then
+    pass "extracted hub-power-restore from bootstrap.sh"
+else
+    fail "could not extract hub-power-restore from bootstrap.sh"
+fi
+chmod +x "$WORK/hub-power-restore"
+
+mkdir -p "$WORK/fakebin3"
+cat >"$WORK/fakebin3/lspci" <<'EOF'
+#!/usr/bin/env bash
+echo "00:1f.0 8086:9d2c 0600: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+EOF
+cat >"$WORK/fakebin3/setpci" <<'EOF'
+#!/usr/bin/env bash
+# fake setpci. A read prints the current byte; a write uses the real
+# pciutils syntax <value>:<mask> and applies (old & ~mask) | (value & mask),
+# so a masked write really does preserve the other bits.
+reg=""
+for arg in "$@"; do
+    case "$arg" in
+        0xa4.b*) reg="$arg" ;;
+    esac
+done
+case "$reg" in
+    "") echo "fake setpci: no 0xa4.b register in the arguments" >&2; exit 2 ;;
+esac
+if [ "${reg#*=}" = "$reg" ]; then
+    val="$(cat "$FAKE_SETPCI_STATE" 2>/dev/null || echo 00)"
+    printf '%s\n' "$val"
+    exit 0
+fi
+rhs="${reg#*=}"
+value="${rhs%%:*}"
+mask="ff"
+case "$rhs" in
+    *:*) mask="${rhs#*:}" ;;
+esac
+old="$(cat "$FAKE_SETPCI_STATE" 2>/dev/null || echo 00)"
+printf 'write %s (old %s)\n' "$rhs" "$old" >>"$FAKE_SETPCI_WRITES"
+new=$(( (0x$old & ~0x$mask) | (0x$value & 0x$mask) ))
+printf '%02x\n' "$new" >"$FAKE_SETPCI_STATE"
+exit 0
+EOF
+chmod +x "$WORK/fakebin3/lspci" "$WORK/fakebin3/setpci"
+
+pr_rc=0
+pr_out=""
+pr_writes=""
+run_power_restore() {
+    printf '%s\n' "$1" >"$WORK/setpci_state"
+    : >"$WORK/setpci_writes"
+    pr_rc=0
+    PATH="$WORK/fakebin3:$PATH" \
+    FAKE_SETPCI_STATE="$WORK/setpci_state" \
+    FAKE_SETPCI_WRITES="$WORK/setpci_writes" \
+        "$WORK/hub-power-restore" >"$WORK/pr.out" 2>&1 || pr_rc=$?
+    pr_out="$(cat "$WORK/pr.out")"
+    pr_writes="$(cat "$WORK/setpci_writes")"
+}
+
+# setpci prints the byte as hex. Every one of these must be read as hex:
+# "08" and "0a" are not valid decimal and "0a" is not valid octal either.
+for value in 00 01 08 0a ff; do
+    run_power_restore "$value"
+    if [ "$pr_rc" -eq 0 ] && ! printf '%s' "$pr_out" | grep -qiE 'value too great|invalid arithmetic|syntax error'; then
+        pass "hub-power-restore: reads 0x$value as hex without an arithmetic error"
+    else
+        fail "hub-power-restore failed on the hex value 0x$value (rc=$pr_rc): $pr_out"
+    fi
+done
+
+# The register is the Intel PCH "LPC_GEN_PMCON_A" (0xA4). Its bit 0 is
+# AFTERG3_EN: 0 = the machine powers on (S0) when AC power comes back after a
+# G3 power loss, 1 = the machine stays off (S5). The kit therefore has to
+# CLEAR bit 0 - and only when bit 0 is set.
+#
+# The pciutils write syntax is <value>:<mask> and the new byte is
+# (old & ~mask) | (value & mask), so "0:1" clears bit 0 and leaves every
+# other bit alone.
+#
+# These checks assert the RESULTING register value, not the command string:
+# a polarity inversion has to fail them.
+check_power_restore_result() {
+    # check_power_restore_result <before> <expected-after> <label>
+    run_power_restore "$1"
+    after="$(cat "$WORK/setpci_state" 2>/dev/null || echo '')"
+    if [ "$after" = "$2" ]; then
+        pass "hub-power-restore: $3 (0x$1 -> 0x$after)"
+    else
+        fail "hub-power-restore: $3 (0x$1 -> 0x$after, expected 0x$2): $pr_out"
+    fi
+}
+check_power_restore_result 01 00 "clears AFTERG3_EN and leaves the other bits alone"
+check_power_restore_result 09 08 "clears AFTERG3_EN and keeps bit 3"
+check_power_restore_result ff fe "clears AFTERG3_EN and keeps every other bit"
+
+# bit 0 already clear -> no write at all, and the register does not move
+for value in 00 08 0a; do
+    run_power_restore "$value"
+    if [ -z "$pr_writes" ]; then
+        pass "hub-power-restore: no write when bit 0 is already clear (0x$value)"
+    else
+        fail "hub-power-restore wrote to the register although bit 0 is clear (0x$value): $pr_writes"
+    fi
+    after="$(cat "$WORK/setpci_state" 2>/dev/null || echo '')"
+    if [ "$after" = "$value" ]; then
+        pass "hub-power-restore: the register is unchanged (0x$value)"
+    else
+        fail "hub-power-restore changed the register (0x$value -> 0x$after)"
+    fi
+done
+
 # --------------------------------------------------------------------------
-# 6. the PROCHOT / thermal check
+# 6. the bootstrap steps
 # --------------------------------------------------------------------------
-info "6. the PROCHOT / thermal check"
+info "6. the bootstrap steps"
+
+build_step_script() {
+    # build_step_script <outfile> <function-name> - the helpers plus the step,
+    # with the step called at the end
+    {
+        printf 'set -uo pipefail\n'
+        for fn in redact log warn have die log_copy "$2"; do
+            extract_function bootstrap/bootstrap.sh "$fn"
+            printf '\n'
+        done
+        printf '%s\n' "$2"
+    } >"$1"
+}
+
+mkdir -p "$WORK/fakebin4"
+cat >"$WORK/fakebin4/sudo" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-n" ]; then shift; fi
+exec "$@"
+EOF
+cat >"$WORK/fakebin4/tailscale" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    up)
+        if [ "${2:-}" = "--help" ]; then
+            echo "Usage: tailscale up [flags]"
+            if [ "${FAKE_TS_HELP_TIMEOUT:-1}" = "1" ]; then
+                echo "      --timeout duration   maximum amount of time to wait"
+            fi
+            exit 0
+        fi
+        printf '%s\n' "$@" >>"$FAKE_TS_ARGS"
+        echo "To authenticate, visit:"
+        echo "  https://login.tailscale.com/a/abc123def456"
+        echo "tskey-supersecretvalue123"
+        exit "${FAKE_TS_RC:-0}"
+        ;;
+    set)
+        exit 0
+        ;;
+esac
+exit 0
+EOF
+cat >"$WORK/fakebin4/pro" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    attach)
+        cat >/dev/null
+        exit "${FAKE_PRO_RC:-0}"
+        ;;
+esac
+exit 0
+EOF
+cat >"$WORK/fakebin4/apt-get" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$FAKE_APT_LOG"
+exit 0
+EOF
+chmod +x "$WORK/fakebin4/sudo" "$WORK/fakebin4/tailscale" \
+    "$WORK/fakebin4/pro" "$WORK/fakebin4/apt-get"
+
+export FAKE_TS_ARGS="$WORK/ts_args.log"
+export FAKE_APT_LOG="$WORK/apt.log"
+
+# --- 6a. step_tailscale ---------------------------------------------------
+build_step_script "$WORK/step_tailscale" step_tailscale
+
+: >"$FAKE_TS_ARGS"
+: >"$WORK/ts-bootstrap.log"
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=johnny \
+    LOG_FILE="$WORK/ts-bootstrap.log" TS_AUTHKEY=tskey-supersecretvalue123 \
+    TS_TAG=tag:hub FAKE_TS_ARGS="$FAKE_TS_ARGS" \
+    bash "$WORK/step_tailscale" 2>&1 || true)"
+if printf '%s' "$out" | grep -q 'https://login.tailscale.com/a/abc123def456'; then
+    pass "step_tailscale: the tailscale up output reaches the terminal"
+else
+    fail "step_tailscale: the tailscale up output never reaches the terminal (got: $out)"
+fi
+if grep -q 'tskey-REDACTED' "$WORK/ts-bootstrap.log" &&
+    ! grep -q 'tskey-supersecretvalue123' "$WORK/ts-bootstrap.log"; then
+    pass "step_tailscale: the log copy is redacted"
+else
+    fail "step_tailscale: the log copy is not redacted (log: $(cat "$WORK/ts-bootstrap.log"))"
+fi
+if grep -q -- '--timeout=120s' "$FAKE_TS_ARGS"; then
+    pass "step_tailscale: passes --timeout=120s when tailscale supports it"
+else
+    fail "step_tailscale: does not pass --timeout=120s (args: $(cat "$FAKE_TS_ARGS"))"
+fi
+
+: >"$FAKE_TS_ARGS"
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=johnny \
+    LOG_FILE="$WORK/ts-bootstrap.log" TS_AUTHKEY=tskey-supersecretvalue123 \
+    TS_TAG=tag:hub FAKE_TS_ARGS="$FAKE_TS_ARGS" FAKE_TS_HELP_TIMEOUT=0 \
+    bash "$WORK/step_tailscale" 2>&1 || true)"
+if ! grep -q -- '--timeout' "$FAKE_TS_ARGS"; then
+    pass "step_tailscale: leaves --timeout out when tailscale does not support it"
+else
+    fail "step_tailscale: passes --timeout even though tailscale does not support it"
+fi
+
+: >"$FAKE_TS_ARGS"
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=johnny \
+    LOG_FILE="$WORK/ts-bootstrap.log" TS_AUTHKEY=tskey-supersecretvalue123 \
+    TS_TAG=tag:hub FAKE_TS_ARGS="$FAKE_TS_ARGS" FAKE_TS_RC=7 \
+    bash "$WORK/step_tailscale" 2>&1 || true)"
+case "$out" in
+    *"tailscale up failed"*) pass "step_tailscale: notices that tailscale up failed" ;;
+    *) fail "step_tailscale: swallows the failure of tailscale up (got: $out)" ;;
+esac
+
+: >"$FAKE_TS_ARGS"
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=johnny \
+    LOG_FILE="$WORK/ts-bootstrap.log" TS_TAG=tag:hub FAKE_TS_ARGS="$FAKE_TS_ARGS" \
+    bash "$WORK/step_tailscale" 2>&1 || true)"
+case "$out" in
+    *"TS_AUTHKEY is not set"*) pass "step_tailscale: says that an interactive login is coming" ;;
+    *) fail "step_tailscale: does not say that an interactive login is coming (got: $out)" ;;
+esac
+
+# The log file is owned by root, so a normal user cannot append to it with
+# "tee". A log write that fails must NOT be reported as a failed step.
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=johnny \
+    LOG_FILE="$WORK/no-such-dir/hub-bootstrap.log" TS_AUTHKEY=tskey-supersecretvalue123 \
+    TS_TAG=tag:hub FAKE_TS_ARGS="$FAKE_TS_ARGS" \
+    bash "$WORK/step_tailscale" 2>&1 || true)"
+case "$out" in
+    *"could not set the tailscale operator"*)
+        fail "step_tailscale: reports a false failure when the log file is not writable" ;;
+    *)
+        pass "step_tailscale: does not report a false failure when the log file is not writable" ;;
+esac
+
+# --- 6b. step_ubuntu_pro --------------------------------------------------
+build_step_script "$WORK/step_ubuntu_pro" step_ubuntu_pro
+
+: >"$WORK/pro-bootstrap.log"
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub \
+    LOG_FILE="$WORK/pro-bootstrap.log" UBUNTU_PRO_TOKEN=probe-token-123 \
+    FAKE_PRO_RC=1 bash "$WORK/step_ubuntu_pro" 2>&1 || true)"
+case "$out" in
+    *"sudo pro attach probe-token-123"*) pass "step_ubuntu_pro: prints the manual pro attach fallback" ;;
+    *) fail "step_ubuntu_pro: no manual pro attach fallback (got: $out)" ;;
+esac
+if ! grep -q 'probe-token-123' "$WORK/pro-bootstrap.log"; then
+    pass "step_ubuntu_pro: the token is not written to the log"
+else
+    fail "step_ubuntu_pro: the token was written to the log"
+fi
+if grep -q 'ppa:ubuntu-pro/ppa' bootstrap/bootstrap.sh; then
+    fail "step_ubuntu_pro: the kit still adds the ubuntu-pro PPA"
+else
+    pass "step_ubuntu_pro: no PPA is added"
+fi
+if grep -q 'ubuntu-pro-client' bootstrap/bootstrap.sh; then
+    pass "step_ubuntu_pro: installs the ubuntu-pro-client package"
+else
+    fail "step_ubuntu_pro: does not install the ubuntu-pro-client package"
+fi
+
+# A log write that fails must not be reported as a failed step.
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub \
+    LOG_FILE="$WORK/no-such-dir/hub-bootstrap.log" UBUNTU_PRO_TOKEN=probe-token-123 \
+    bash "$WORK/step_ubuntu_pro" 2>&1 || true)"
+case "$out" in
+    *"livepatch could not be enabled"*)
+        fail "step_ubuntu_pro: reports a false failure when the log file is not writable" ;;
+    *)
+        pass "step_ubuntu_pro: does not report a false failure when the log file is not writable" ;;
+esac
+
+# --------------------------------------------------------------------------
+# 7. the PROCHOT / thermal check
+# --------------------------------------------------------------------------
+info "7. the PROCHOT / thermal check"
 THROTTLE_SRC="bootstrap/optional/44-tune-lowpower.sh"
 if extract_block "$THROTTLE_SRC" "/usr/local/bin/hub-throttle-check <<'EOF'" >"$WORK/hub-throttle-check" &&
     [ -s "$WORK/hub-throttle-check" ]; then
@@ -725,9 +1162,9 @@ esac
 FAKE_RDMSR_VALUE="88450020"
 
 # --------------------------------------------------------------------------
-# 7. secret scan
+# 8. secret scan
 # --------------------------------------------------------------------------
-info "7. secret scan"
+info "8. secret scan"
 if bash tests/secret-scan.sh >"$WORK/secrets.out" 2>&1; then
     pass "the secret scan is clean"
     sed 's/^/      /' "$WORK/secrets.out" | grep -E '^(clean|FINDING)' | head -12

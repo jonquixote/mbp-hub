@@ -174,17 +174,23 @@ Plug it into the hub before you start and use it for the installer only.
 # 1. copy the kit to the new box and run it
 git clone https://github.com/jonquixote/mbp-hub.git
 cd mbp-hub
-bash bootstrap/bootstrap.sh
+UBUNTU_PRO_TOKEN=... TS_AUTHKEY=... TS_TAG=tag:hub HC_URL=... bash bootstrap/bootstrap.sh
 
 # 2. check that everything is sane
 hub-status
 
-# 3. optional modules, one at a time
+# 3. optional modules, one at a time (as root, secrets from the environment
+#    or from /etc/hub/optional.env)
 sudo bash bootstrap/optional/04-wifi.sh          # WIFI_SSID / WIFI_PASS
 sudo bash bootstrap/optional/20-jellyfin.sh
 sudo bash bootstrap/optional/40-vault.sh
 sudo bash bootstrap/optional/45-wifi-firmware.sh <dir>
 ```
+
+The bootstrap runs as your **normal user** - it calls `sudo` itself where it
+needs root. Do not run it with `sudo` and do not use `sudo --preserve-env`
+for it; the `sudo --preserve-env` form belongs to the optional modules, which
+do run as root.
 
 Then the manual steps that no script should do for you:
 
@@ -339,7 +345,7 @@ Things this kit could not verify, with the test that would settle each one.
 | Unknown | Why it is unknown | How to settle it |
 |---|---|---|
 | Does the hub auto-start after an AC power cut? | `setpci 0xa4` bit semantics are documented for other Macs, not confirmed for 14,1 | Plug-pull test (acceptance check 6) |
-| Is the `0xa4` guard's polarity right? | The kit writes `0xa4.b=0:1` when bit 0 is *already* set, as specified | Read the value before and after; compare with the plug-pull result |
+| Is the `0xa4` guard's polarity right? | The kit writes `0xa4.b=0:1` (clears bit 0) when bit 0 is *already* set; the Intel PCH datasheet documents AFTERG3_EN bit 0 as 0 = S0 on power return, 1 = S5 | Read the value before and after; compare with the plug-pull result |
 | Does the internal keyboard work under Linux? | The live-installer test has not been run on this machine | DRY-BOOT test (section 4) |
 | How fast is the Wi-Fi with the Apple board files, and is the board-file *name* right? | The board files are not on the box yet, and the name is derived from the brcmfmac convention rather than read off the hardware | Install them, then compare `iw dev wlp2s0 link` |
 | Is the CPU throttled by PROCHOT with the battery in place? | The battery reports service-required; behaviour on Linux is unknown | `hub-throttle-check` |

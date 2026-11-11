@@ -39,6 +39,17 @@ release checklist.
 | `RD_PASS` | `30-gui-rustdesk.sh` | RustDesk unattended-access password |
 | `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE` | `41-backup-restic.sh` | **no defaults**: you create `/etc/hub/restic.env` yourself |
 
+The bootstrap itself is run by your **normal user** (it calls `sudo` itself
+where it needs root). Give it its secrets in the environment - never with
+`sudo --preserve-env` and never with `sudo bash bootstrap/bootstrap.sh`:
+
+```bash
+UBUNTU_PRO_TOKEN=... TS_AUTHKEY=... TS_TAG=tag:hub HC_URL=... bash bootstrap/bootstrap.sh
+```
+
+The optional modules are different: they run as root, so they read their
+secrets from the environment or from `/etc/hub/optional.env`:
+
 Two ways to give a module its secrets:
 
 ```bash
@@ -88,7 +99,7 @@ mbp-hub/
 ```bash
 git clone https://github.com/jonquixote/mbp-hub.git
 cd mbp-hub
-bash bootstrap/bootstrap.sh
+UBUNTU_PRO_TOKEN=... TS_AUTHKEY=... TS_TAG=tag:hub HC_URL=... bash bootstrap/bootstrap.sh
 hub-status
 ```
 
@@ -176,9 +187,12 @@ as a fact.
    Mac (`make-installer-usb.sh`). Without it the signature check reports "no
    public key" and continues - the SHA256 is the hard gate.
 2. **The `0xa4` bit-0 guard** in `hub-power-restore` is implemented exactly as
-   specified (write when bit 0 is *already* set), but the polarity of that bit
-   for auto-restart-after-AC-loss on this MacBook is unconfirmed. Settle it
-   with the **plug-pull test** in the acceptance checklist.
+   specified (write when bit 0 is *already* set). The Intel PCH datasheet
+   documents bit 0 of `LPC_GEN_PMCON_A` (AFTERG3_EN) as 0 = the machine powers
+   on (S0) when AC power comes back after a G3 power loss, 1 = it stays off
+   (S5) - which is why the kit clears that bit. Whether that holds for this
+   MacBook is still unconfirmed: settle it with the **plug-pull test** in the
+   acceptance checklist.
 3. **`BCLM` / `BFCL` SMC keys** - that they exist and behave as described in
    `docs/battery-charge-limit-notes.md` was read from the upstream source, not
    tested on this hardware.

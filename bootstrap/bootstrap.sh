@@ -102,6 +102,16 @@ have() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# log_copy - append stdin to the log file, redacted. The log file is owned by
+# root, so a normal user needs sudo to append to it.
+log_copy() {
+    if [ -w "$LOG_FILE" ] 2>/dev/null; then
+        redact >>"$LOG_FILE"
+    else
+        redact | sudo tee -a "$LOG_FILE" >/dev/null 2>&1 || true
+    fi
+}
+
 # write_root_file <mode> <path> [owner] [group]  (content on stdin)
 write_root_file() {
     local mode="$1" path="$2" owner="${3:-root}" group="${4:-root}"
@@ -147,9 +157,7 @@ step_ubuntu_pro() {
         return 0
     fi
     if ! have pro; then
-        sudo apt-get install -y software-properties-common || warn "software-properties-common failed"
-        sudo add-apt-repository -y ppa:ubuntu-pro/ppa || warn "ubuntu-pro PPA failed"
-        sudo apt-get update
+        # The Ubuntu Pro client ships with Ubuntu Server - no PPA needed.
         sudo apt-get install -y ubuntu-pro-client || warn "ubuntu-pro-client install failed"
     fi
     if ! have pro; then
@@ -157,12 +165,24 @@ step_ubuntu_pro() {
         return 0
     fi
     # The token is piped in on stdin so it never appears in argv or in the log.
-    if printf '%s' "$UBUNTU_PRO_TOKEN" | sudo -n pro attach 2>&1 | redact | tee -a "$LOG_FILE" >/dev/null; then
+    local pro_rc=0
+    set +e
+    printf '%s' "$UBUNTU_PRO_TOKEN" | sudo -n pro attach 2>&1 | log_copy
+    pro_rc=${PIPESTATUS[1]}
+    set -e
+    if [ "$pro_rc" -eq 0 ]; then
         log "ubuntu pro attached"
     else
-        warn "pro attach failed - see $LOG_FILE"
+        warn "pro attach failed (exit $pro_rc) - see $LOG_FILE"
+        warn "attach Ubuntu Pro by hand with:"
+        printf '    sudo pro attach %s\n' "$UBUNTU_PRO_TOKEN"
     fi
-    if sudo -n pro enable livepatch 2>&1 | redact | tee -a "$LOG_FILE" >/dev/null; then
+    local lp_rc=0
+    set +e
+    sudo -n pro enable livepatch 2>&1 | log_copy
+    lp_rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$lp_rc" -eq 0 ]; then
         log "livepatch enabled"
     else
         warn "livepatch could not be enabled (kernel coverage may not exist for $HUB_HOSTNAME's kernel)"
@@ -255,19 +275,41 @@ step_tailscale() {
         # "tailscale up" by hand and paste the key if that matters to you.
         args+=(--auth-key "$TS_AUTHKEY")
         log "using TS_AUTHKEY from the environment"
+    else
+        log "TS_AUTHKEY is not set - tailscale will print a login URL; open it in a browser to finish the login"
     fi
     if [ -n "${TS_TAG:-}" ]; then
         args+=(--advertise-tags="$TS_TAG")
         log "requesting tailscale tag: $TS_TAG"
     fi
 
-    if sudo tailscale up "${args[@]}" 2>&1 | redact | tee -a "$LOG_FILE" >/dev/null; then
+    # --timeout is only used when this tailscale version supports it.
+    local ts_help
+    ts_help="$(tailscale up --help 2>&1 || true)"
+    case "$ts_help" in
+        *--timeout*) args+=(--timeout=120s) ;;
+    esac
+
+    # The output has to reach the terminal: it carries the login URL, and
+    # "tailscale up" waits for that login. Only the copy in the log is
+    # redacted. The exit status of "tailscale up" itself is kept.
+    local ts_rc=0
+    set +e
+    sudo tailscale up "${args[@]}" 2>&1 | tee >(log_copy)
+    ts_rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$ts_rc" -eq 0 ]; then
         log "tailscale is up as '$HUB_HOSTNAME'"
     else
-        warn "tailscale up failed - see $LOG_FILE"
+        warn "tailscale up failed (exit $ts_rc) - see $LOG_FILE"
     fi
 
-    if sudo tailscale set --operator="$HUB_USER" 2>&1 | redact | tee -a "$LOG_FILE" >/dev/null; then
+    local tsop_rc=0
+    set +e
+    sudo tailscale set --operator="$HUB_USER" 2>&1 | log_copy
+    tsop_rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$tsop_rc" -eq 0 ]; then
         log "tailscale operator set to $HUB_USER"
     else
         warn "could not set the tailscale operator (needs a tailnet admin)"
@@ -407,7 +449,10 @@ Unattended-Upgrade::Remove-Unused-Dependencies "true";
 EOF
     sudo systemctl enable --now unattended-upgrades || warn "could not enable unattended-upgrades"
 
-    write_root_file 0644 /etc/needrestart/needrestart.conf <<'EOF'
+    # The settings go into the drop-in directory, so the distribution's own
+    # /etc/needrestart/needrestart.conf stays untouched.
+    sudo install -d -o root -g root -m 0755 /etc/needrestart/conf.d
+    write_root_file 0644 /etc/needrestart/conf.d/50-hub.conf <<'EOF'
 # managed by mbp-hub bootstrap
 # Restart services automatically after package updates, but never these:
 # rebooting the hub in the middle of a remote session is worse than a stale
@@ -554,7 +599,17 @@ echo "LPC bridge: $bdf"
 before="$(setpci -s "$bdf" "$REG")"
 echo "read $REG = $before"
 
-num=$((before))
+# setpci prints the byte as hex ("0a"), so it has to be read as hex. Parsing
+# it as decimal (or as octal) breaks on "08" and "0a".
+hex="${before#0x}"
+hex="${hex#0X}"
+case "$hex" in
+    ''|*[!0-9a-fA-F]*)
+        echo "cannot parse the value read from $REG: '$before'" >&2
+        exit 1
+        ;;
+esac
+num=$((16#$hex))
 if [ "$CHECK_ONLY" -eq 1 ]; then
     echo "check mode: not writing"
     exit 0
@@ -566,7 +621,15 @@ if [ "$HUB_SETPCI" = "0" ]; then
 fi
 
 if [ $((num & 1)) -ne 0 ]; then
-    echo "bit 0 is set - applying the masked write ($REG=0:1, other bits preserved)"
+    # The register is the Intel PCH "LPC_GEN_PMCON_A" (0xA4). Its bit 0 is
+    # AFTERG3_EN: 0 = the machine powers on (S0) when AC power comes back
+    # after a G3 power loss, 1 = the machine stays off (S5). The bit is set
+    # now, so it has to be cleared.
+    #
+    # The pciutils syntax is <value>:<mask> and the new byte is
+    # (old & ~mask) | (value & mask), so "0:1" clears bit 0 and leaves every
+    # other bit alone ("1:1" would SET it and keep the machine off).
+    echo "bit 0 is set - clearing AFTERG3_EN with the masked write ($REG=0:1, other bits preserved)"
     setpci -s "$bdf" "$REG=0:1"
     after="$(setpci -s "$bdf" "$REG")"
     echo "read $REG = $after"
@@ -578,12 +641,14 @@ EOF
     write_root_file 0644 /etc/systemd/system/hub-power-restore.service <<'EOF'
 [Unit]
 Description=Restore auto-start after AC power loss (Intel LPC 0xa4)
-After=multi-user.target
 ConditionPathExists=/usr/local/sbin/hub-power-restore
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/hub-power-restore
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
     sudo systemctl daemon-reload
@@ -623,12 +688,15 @@ if [ -z "$HC_URL" ]; then
     exit 0
 fi
 
-if tailscale ip -4 >/dev/null 2>&1; then
+# The node counts as online only when the tailscale backend says "Running".
+# ("tailscale ip -4" can still succeed while the backend is down.)
+ts_state="$(tailscale status --json 2>/dev/null | jq -r '.BackendState // ""' 2>/dev/null || true)"
+if [ "$ts_state" = "Running" ]; then
     target="$HC_URL"
-    state="tailscale-ip-present"
+    state="tailscale-running"
 else
     target="${HC_URL%/}/fail"
-    state="no-tailscale-ip"
+    state="tailscale-not-running"
 fi
 
 case "$target" in
@@ -800,6 +868,9 @@ banner() {
  log         : $LOG_FILE
 
  NEXT STEPS
+
+ 0. Re-running the bootstrap (as your normal user, never with sudo)
+      UBUNTU_PRO_TOKEN=... TS_AUTHKEY=... TS_TAG=tag:hub HC_URL=... bash bootstrap/bootstrap.sh
 
  1. Tailscale admin
       open https://login.tailscale.com/admin/machines

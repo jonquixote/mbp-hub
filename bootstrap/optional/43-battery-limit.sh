@@ -81,11 +81,14 @@ else
         cat >/etc/systemd/system/hub-battery-limit.service <<EOF
 [Unit]
 Description=Keep the battery below the charge threshold
-After=multi-user.target
+ConditionPathExists=/sys/class/power_supply/BAT*/charge_control_end_threshold
 
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c 'echo ${LIMIT} > ${threshold_file}'
+
+[Install]
+WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable hub-battery-limit.service || warn_log "could not enable the unit"

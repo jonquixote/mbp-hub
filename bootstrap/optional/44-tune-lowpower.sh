@@ -30,11 +30,13 @@ if [ -e "$epp_file" ]; then
     cat >/etc/systemd/system/hub-epp.service <<EOF
 [Unit]
 Description=Set the CPU energy performance preference to balance_power
-After=multi-user.target
 
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c 'echo balance_power > ${epp_file}'
+
+[Install]
+WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable hub-epp.service || warn_log "could not enable hub-epp.service"
