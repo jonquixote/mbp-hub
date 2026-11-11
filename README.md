@@ -148,12 +148,13 @@ this kit - re-run the suite before you trust it.
 
 ## Ubuntu 26.04 specifics this kit had to respect
 
-* **sudo-rs** is the default `sudo` on 26.04, and `sudo -E` is documented as
-  ignored by it ("preserving the entire environment is not supported"), so the
-  kit uses `sudo --preserve-env=VAR1,VAR2` and a root-owned `0600` env file
-  instead. TODO(verify): the sudo implementation and version on the real box
-  - the container test ran as root, where `-E` appeared to keep the variable,
-  so the ignore-message was not reproduced there.
+* **sudo-rs** is the default `sudo` on 26.04, and `sudo -E` is ignored by it:
+  during the test phase, in-container as a non-root user, sudo-rs 0.2.13
+  printed "preserving the entire environment is not supported, '-E' is
+  ignored". So the kit uses `sudo --preserve-env=VAR1,VAR2` and a root-owned
+  `0600` env file instead. TODO(verify): the sudo implementation and version
+  on the real box - the shipped harness runs as root, where `-E` appeared to
+  keep the variable, so the ignore-message is not reproduced there.
 * **uutils coreutils** replace GNU coreutils for everything except `cp`, `df`,
   `mv`, `rm` and `true`. The coreutils calls the kit relies on most (`stat`,
   `date`, `install`, `cut`, `head`, `tee`, `sed -i`, `awk`, `mktemp`, `tr`,

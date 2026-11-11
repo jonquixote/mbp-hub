@@ -411,9 +411,10 @@ EOF
 # managed by mbp-hub bootstrap
 # Restart services automatically after package updates, but never these:
 # rebooting the hub in the middle of a remote session is worse than a stale
-# service. The key names below are the ones needrestart actually reads, and
-# the config was validated with "perl -c" and "needrestart -b" in the 26.04
-# container. TODO(verify): the needrestart version on the real box.
+# service. The key names below are the ones needrestart actually reads; they
+# were verified in-container against needrestart 3.11 during the test phase,
+# and the config is validated with "perl -c" and "needrestart -b" in the
+# 26.04 container. TODO(verify): the needrestart version on the real box.
 $nrconf{restart} = 'a';
 $nrconf{blacklist_rc} = [
     qr(^ssh\.service$),
