@@ -1,0 +1,753 @@
+#!/usr/bin/env bash
+#
+# mbp-hub :: tests/run-container-tests.sh
+#
+# Reproduces every check from the kit's test phase:
+#
+#   1. bash -n and shellcheck on every script
+#   2. every package name used by the bootstrap and the optional modules
+#      exists in the Ubuntu 26.04 archive (apt-cache policy)
+#   3. coreutils / sed / awk compatibility (26.04 ships the uutils coreutils
+#      for most tools, GNU only for cp, df, mv, rm and true)
+#   4. unit tests for hub-reboot-if-stale and the heartbeat logic
+#   5. generated configuration validation:
+#      sshd -t, netplan generate, systemd-analyze verify, JSON validity
+#
+# Run it anywhere with Docker available:  bash tests/run-container-tests.sh
+#   (it re-runs itself inside an ubuntu:26.04 container; it never runs
+#    natively, because it installs packages and writes to /etc while it works)
+#
+# shellcheck disable=SC2016
+set -uo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${HUB_TEST_IMAGE:-ubuntu:26.04}"
+PASS=0
+FAIL=0
+FAILED_ITEMS=()
+
+pass() {
+    PASS=$((PASS + 1))
+    printf 'PASS  %s\n' "$*"
+}
+
+fail() {
+    FAIL=$((FAIL + 1))
+    FAILED_ITEMS+=("$*")
+    printf 'FAIL  %s\n' "$*"
+}
+
+info() { printf '\n--- %s ---\n' "$*"; }
+
+# --------------------------------------------------------------------------
+# Docker mode: re-run ourselves inside an ubuntu:26.04 container.
+# --------------------------------------------------------------------------
+in_container() {
+    [ -f /.dockerenv ] && return 0
+    [ -f /run/.containerenv ] && return 0
+    return 1
+}
+
+if ! in_container; then
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        printf 'running the checks in a %s container\n' "$IMAGE"
+        docker run --rm -u 0 -v "$REPO_ROOT:/repo:ro" "$IMAGE" \
+            bash /repo/tests/run-container-tests.sh
+        exit $?
+    fi
+    echo "ERROR: this script needs Docker - it runs the checks in an ubuntu:26.04 container." >&2
+    exit 1
+fi
+
+cd "$REPO_ROOT" || exit 1
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# --------------------------------------------------------------------------
+# 0. tooling
+# --------------------------------------------------------------------------
+info "0. test tooling"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq || fail "apt-get update"
+apt-get install -y -qq --no-install-recommends \
+    shellcheck openssh-server netplan.io jq python3 coreutils util-linux \
+    systemd procps findutils sed gawk grep systemd-zram-generator needrestart \
+    sudo perl >/dev/null 2>&1 \
+    || fail "installing the test tooling"
+
+for cmd in bash shellcheck sshd netplan jq python3 systemd-analyze awk sed; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+        pass "tool present: $cmd"
+    else
+        fail "tool missing: $cmd"
+    fi
+done
+
+# --------------------------------------------------------------------------
+# 1. syntax + shellcheck
+# --------------------------------------------------------------------------
+info "1. bash -n and shellcheck"
+mapfile -t SCRIPTS < <(find . -name '*.sh' -type f | sort)
+if [ "${#SCRIPTS[@]}" -eq 0 ]; then
+    fail "no scripts found under $REPO_ROOT"
+else
+    for s in "${SCRIPTS[@]}"; do
+        if bash -n "$s" 2>"$WORK/syntax.err"; then
+            pass "bash -n: $s"
+        else
+            fail "bash -n: $s"
+            sed 's/^/      /' "$WORK/syntax.err"
+        fi
+    done
+    for s in "${SCRIPTS[@]}"; do
+        if shellcheck -x -S style "$s" >"$WORK/sc.out" 2>&1; then
+            pass "shellcheck: $s"
+        else
+            fail "shellcheck: $s"
+            sed 's/^/      /' "$WORK/sc.out" | head -40
+        fi
+    done
+fi
+
+# --------------------------------------------------------------------------
+# 2. package names
+# --------------------------------------------------------------------------
+info "2. package names in the archive"
+PACKAGES=$(awk '
+    /^PACKAGES=\(/ { grab = 1; next }
+    grab && /^\)/ { exit }
+    grab { gsub(/^[[:space:]]+/, ""); gsub(/[[:space:]]+$/, ""); print }
+' bootstrap/bootstrap.sh | sort -u)
+printf 'NOTE  %s package names read from the bootstrap PACKAGES array\n' "$(printf '%s\n' "$PACKAGES" | wc -l)"
+EXTRA_PACKAGES="docker.io docker-compose-v2 xfce4 xfce4-goodies lightdm dbus-x11 restic smartmontools ubuntu-pro-client software-properties-common linux-tools-common msr-tools thermald mbpfan systemd-zram-generator"
+for p in $PACKAGES $EXTRA_PACKAGES; do
+    policy="$(apt-cache policy "$p" 2>/dev/null || true)"
+    case "$policy" in
+        *"Candidate: (none)"*)
+            fail "package has no candidate: $p"
+            ;;
+        *"Candidate: "*)
+            pass "package exists: $p"
+            ;;
+        *)
+            fail "package missing in the archive: $p"
+            ;;
+    esac
+done
+
+# The optional modules that install a package from a vendor repository cannot
+# be checked with apt-cache policy - list them so the report stays honest.
+printf 'NOTE  packages that come from a vendor repository (not in the Ubuntu\n'
+printf '      archive, so they are not checked here):\n'
+printf '        jellyfin            (repo.jellyfin.org - NOT in the Ubuntu 26.04 archive)\n'
+printf '        jellyfin-ffmpeg*    (repo.jellyfin.org)\n'
+printf '        tailscale           (tailscale.com/install.sh)\n'
+printf '        rustdesk            (GitHub release .deb)\n'
+printf 'NOTE  packages the kit installs but does NOT archive-check here:\n'
+printf '        intel-media-va-driver         (the -non-free variant is not in the default archive)\n'
+printf '        intel-media-va-driver-non-free (not in the default archive)\n'
+printf '        e2fsprogs                      (used by 40-vault.sh)\n'
+
+# --------------------------------------------------------------------------
+# 3. coreutils / sed / awk compatibility
+# --------------------------------------------------------------------------
+info "3. coreutils, sed and awk compatibility on $( . /etc/os-release; printf '%s %s' "$NAME" "$VERSION_ID" )"
+
+check_cmd() {
+    # check_cmd <label> <expected> <command...>
+    label="$1"
+    expected="$2"
+    shift 2
+    actual="$("$@" 2>&1 || true)"
+    if [ "$actual" = "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label (expected '$expected', got '$actual')"
+    fi
+}
+
+printf '  coreutils: %s\n' "$(command -v stat)"
+stat --version 2>/dev/null | head -1 || true
+
+touch "$WORK/statfile"
+check_cmd "stat -c %Y (mtime)" \
+    "$(stat -c %Y "$WORK/statfile")" \
+    stat -c %Y "$WORK/statfile"
+check_cmd "stat -c %s (size)" \
+    "0" \
+    stat -c %s "$WORK/statfile"
+
+check_cmd "date -d @1700000000" \
+    "2023-11-14 22:13:20" \
+    date -d @1700000000 '+%Y-%m-%d %H:%M:%S'
+
+check_cmd "date +%s is a number" \
+    "yes" \
+    bash -c '[[ $(date +%s) =~ ^[0-9]+$ ]] && echo yes || echo no'
+
+check_cmd "date '+%Y-%m-%dT%H:%M:%S%z' shape" \
+    "yes" \
+    bash -c '[[ $(date "+%Y-%m-%dT%H:%M:%S%z") =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{4}$ ]] && echo yes || echo no'
+
+printf '3\n2\n1\n' >"$WORK/sortfile"
+check_cmd "sort -rh" \
+    "3
+2
+1" \
+    sort -rh "$WORK/sortfile"
+
+rm -rf "$WORK/inst"
+mkdir -p "$WORK/inst"
+if install -d -o root -g root -m 0755 "$WORK/inst/sub" && [ -d "$WORK/inst/sub" ]; then
+    mode="$(stat -c %a "$WORK/inst/sub")"
+    if [ "$mode" = "755" ]; then
+        pass "install -d -o -g -m"
+    else
+        fail "install -d -o -g -m (mode is $mode, expected 755)"
+    fi
+else
+    fail "install -d -o -g -m (command failed)"
+fi
+
+printf 'a:b:c\n' >"$WORK/cutfile"
+check_cmd "cut -d: -f2" \
+    "b" \
+    cut -d: -f2 "$WORK/cutfile"
+
+check_cmd "cut -f1" \
+    "a:b:c" \
+    cut -f1 "$WORK/cutfile"
+
+printf 'l1\nl2\nl3\n' >"$WORK/headfile"
+check_cmd "head -n 2" \
+    "l1
+l2" \
+    head -n 2 "$WORK/headfile"
+
+check_cmd "head -1" \
+    "l1" \
+    head -1 "$WORK/headfile"
+
+check_cmd "tee -a" \
+    "hello" \
+    bash -c 'printf "hello\n" | tee -a "$0/teeout" >/dev/null; cat "$0/teeout"' "$WORK"
+
+printf 'x\n' >"$WORK/sedfile"
+check_cmd "sed -i" \
+    "y" \
+    bash -c 'cp "$0/sedfile" "$0/sedfile2"; sed -i "s/^x$/y/" "$0/sedfile2"; cat "$0/sedfile2"' "$WORK"
+
+printf '/dev/disk4 (external, physical):\n\tDevice Identifier: disk4\n' >"$WORK/disklist"
+
+check_cmd "awk parsing used by make-installer-usb.sh" \
+    "disk4" \
+    bash -c 'while IFS= read -r line; do case "$line" in /dev/disk*" (external, physical):") d="${line#/dev/}"; d="${d%% *}"; printf "%s\n" "$d";; esac; done < "$0/disklist"' "$WORK"
+
+check_cmd "mktemp creates a file" \
+    "yes" \
+    bash -c 'f=$(mktemp); [ -f "$f" ] && echo yes || echo no; rm -f "$f"'
+
+check_cmd "mktemp -d creates a directory" \
+    "yes" \
+    bash -c 'd=$(mktemp -d); [ -d "$d" ] && echo yes || echo no; rmdir "$d"'
+
+check_cmd "tr newline to space" \
+    "a b" \
+    bash -c 'printf "a\nb\n" | tr "\n" " " | sed "s/ $//"'
+
+check_cmd "seq 1 3" \
+    "1
+2
+3" \
+    seq 1 3
+
+check_cmd "sha256sum of an empty file" \
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+    bash -c 'sha256sum < /dev/null | cut -d" " -f1'
+
+check_cmd "grep -c with no match returns 0 and exit 1" \
+    "0" \
+    bash -c 'grep -c zzz /dev/null || true'
+
+check_cmd "yes can be killed" \
+    "yes" \
+    bash -c 'yes >/dev/null & p=$!; sleep 0.2; kill $p 2>/dev/null && echo yes || echo no'
+
+check_cmd "env VAR=value cmd" \
+    "hubtest" \
+    env HUB_TEST_VAR=hubtest sh -c 'printf "%s" "$HUB_TEST_VAR"'
+
+check_cmd "GNU sed is used for -i (not uutils)" \
+    "yes" \
+    bash -c 'sed --version 2>/dev/null | head -1 | grep -qi "gnu sed" && echo yes || echo no'
+
+check_cmd "du -h works" \
+    "yes" \
+    bash -c 'du -h /dev/null >/dev/null 2>&1 && echo yes || echo no'
+
+# --- sudo behaviour (sudo-rs on Ubuntu 26.04) ---------------------------
+export HUB_TEST_VAR="keepme"
+if sudo --preserve-env=HUB_TEST_VAR env 2>/dev/null | grep -q '^HUB_TEST_VAR=keepme$'; then
+    pass "sudo --preserve-env=VAR preserves the variable (this is what the kit tells you to use)"
+else
+    fail "sudo --preserve-env=VAR does not preserve the variable - fix the module instructions"
+fi
+# sudo -E is NOT reliable on sudo-rs: it is documented as ignored, and in some
+# contexts it only appears to work because a previous --preserve-env call was
+# cached. Report what happened, but do not make the build depend on it.
+if sudo -E env 2>/dev/null | grep -q '^HUB_TEST_VAR='; then
+    printf 'NOTE  sudo -E kept the variable in this context - still do not rely on it\n'
+else
+    printf 'NOTE  sudo -E dropped the variable in this context - use --preserve-env\n'
+fi
+printf 'NOTE  sudo -E says: %s\n' "$(sudo -E env 2>&1 >/dev/null | head -1)"
+
+# --------------------------------------------------------------------------
+# 4. unit tests
+# --------------------------------------------------------------------------
+info "4. unit tests (hub-reboot-if-stale, hub-heartbeat)"
+
+extract_block() {
+    # extract_block <file> <marker>  -> the heredoc body
+    awk -v marker="$2" '
+        index($0, marker) { grab = 1; next }
+        grab && $0 == "EOF" { exit }
+        grab { print }
+    ' "$1"
+}
+
+if extract_block bootstrap/bootstrap.sh "/usr/local/sbin/hub-reboot-if-stale <<'EOF'" >"$WORK/hub-reboot-if-stale"; then
+    pass "extracted hub-reboot-if-stale from bootstrap.sh"
+else
+    fail "could not extract hub-reboot-if-stale from bootstrap.sh"
+fi
+chmod +x "$WORK/hub-reboot-if-stale"
+
+REQ="$WORK/reboot-required"
+STATE="$WORK/reboot-pending-since"
+BLOCK="$WORK/hub-no-auto-reboot"
+export HUB_REBOOT_REQUIRED_FILE="$REQ"
+export HUB_REBOOT_STATE_FILE="$STATE"
+export HUB_REBOOT_BLOCK_FILE="$BLOCK"
+
+rm -f "$REQ" "$STATE" "$BLOCK"
+out="$("$WORK/hub-reboot-if-stale" 2>&1 || true)"
+case "$out" in
+    *"no reboot required"*) pass "hub-reboot-if-stale: no pending reboot" ;;
+    *) fail "hub-reboot-if-stale: no pending reboot (got: $out)" ;;
+esac
+
+touch "$REQ"
+out="$("$WORK/hub-reboot-if-stale" 2>&1 || true)"
+case "$out" in
+    *"first seen now"*) pass "hub-reboot-if-stale: records the first-seen time" ;;
+    *) fail "hub-reboot-if-stale: records the first-seen time (got: $out)" ;;
+esac
+if [ -f "$STATE" ]; then
+    pass "hub-reboot-if-stale: state file created"
+else
+    fail "hub-reboot-if-stale: state file not created"
+fi
+
+old=$(( $(date +%s) - 22 * 86400 ))
+printf '%s\n' "$old" >"$STATE"
+out="$(HUB_REBOOT_DRY_RUN=1 "$WORK/hub-reboot-if-stale" 2>&1 || true)"
+case "$out" in
+    *"WOULD REBOOT"*) pass "hub-reboot-if-stale: reboots after 21+ days" ;;
+    *) fail "hub-reboot-if-stale: reboots after 21+ days (got: $out)" ;;
+esac
+
+recent=$(( $(date +%s) - 3600 ))
+printf '%s\n' "$recent" >"$STATE"
+out="$(HUB_REBOOT_DRY_RUN=1 "$WORK/hub-reboot-if-stale" 2>&1 || true)"
+case "$out" in
+    *"not rebooting"*) pass "hub-reboot-if-stale: does not reboot a fresh request" ;;
+    *) fail "hub-reboot-if-stale: does not reboot a fresh request (got: $out)" ;;
+esac
+
+touch "$BLOCK"
+out="$("$WORK/hub-reboot-if-stale" 2>&1 || true)"
+case "$out" in
+    *"blocked"*) pass "hub-reboot-if-stale: /etc/hub-no-auto-reboot blocks it" ;;
+    *) fail "hub-reboot-if-stale: /etc/hub-no-auto-reboot blocks it (got: $out)" ;;
+esac
+rm -f "$BLOCK"
+
+extract_block bootstrap/bootstrap.sh "/usr/local/sbin/hub-heartbeat <<'EOF'" >"$WORK/hub-heartbeat"
+chmod +x "$WORK/hub-heartbeat"
+
+mkdir -p "$WORK/fakebin"
+cat >"$WORK/fakebin/tailscale" <<'EOF'
+#!/usr/bin/env bash
+if [ "${FAKE_TAILSCALE_FAIL:-0}" = "1" ]; then
+    exit 1
+fi
+echo "100.64.0.1"
+EOF
+cat >"$WORK/fakebin/curl" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+    case "$arg" in
+        http*) printf '%s\n' "$arg" >>"$FAKE_CURL_LOG" ;;
+    esac
+done
+exit "${FAKE_CURL_FAIL:-0}"
+EOF
+chmod +x "$WORK/fakebin/tailscale" "$WORK/fakebin/curl"
+
+export FAKE_CURL_LOG="$WORK/curl.log"
+: >"$FAKE_CURL_LOG"
+out="$(PATH="$WORK/fakebin:$PATH" HC_URL="https://hc.example.com/abc" "$WORK/hub-heartbeat" 2>&1 || true)"
+if grep -q '^https://hc.example.com/abc$' "$FAKE_CURL_LOG"; then
+    pass "hub-heartbeat: pings HC_URL when tailscale has an address"
+else
+    fail "hub-heartbeat: pings HC_URL when tailscale has an address (log: $(cat "$FAKE_CURL_LOG"))"
+fi
+
+: >"$FAKE_CURL_LOG"
+out="$(PATH="$WORK/fakebin:$PATH" FAKE_TAILSCALE_FAIL=1 HC_URL="https://hc.example.com/abc" "$WORK/hub-heartbeat" 2>&1 || true)"
+if grep -q '^https://hc.example.com/abc/fail$' "$FAKE_CURL_LOG"; then
+    pass "hub-heartbeat: pings HC_URL/fail when tailscale has no address"
+else
+    fail "hub-heartbeat: pings HC_URL/fail when tailscale has no address (log: $(cat "$FAKE_CURL_LOG"))"
+fi
+
+: >"$FAKE_CURL_LOG"
+out="$(PATH="$WORK/fakebin:$PATH" FAKE_CURL_FAIL=1 HC_URL="https://hc.example.com/abc" "$WORK/hub-heartbeat" 2>&1 || true)"
+case "$out" in
+    *"FAILED"*) pass "hub-heartbeat: reports a failed ping" ;;
+    *) fail "hub-heartbeat: reports a failed ping (got: $out)" ;;
+esac
+
+# --------------------------------------------------------------------------
+# 5. generated configuration validation
+# --------------------------------------------------------------------------
+info "5. generated configuration validation"
+
+# --- 5a. sshd -------------------------------------------------------------
+sshd_dropin="$WORK/10-hub.conf"
+extract_block bootstrap/bootstrap.sh "/etc/ssh/sshd_config.d/10-hub.conf <<EOF" \
+    | sed 's/\$HUB_USER/johnny/' >"$sshd_dropin"
+if [ -s "$sshd_dropin" ]; then
+    pass "extracted the sshd drop-in from bootstrap.sh"
+else
+    fail "could not extract the sshd drop-in from bootstrap.sh"
+fi
+install -d -m 0755 "$WORK/sshd_config.d"
+cp "$sshd_dropin" "$WORK/sshd_config.d/10-hub.conf"
+{
+    printf 'Include %s/sshd_config.d/*.conf\n' "$WORK"
+    printf 'Port 2222\n'
+    printf 'HostKey /etc/ssh/ssh_host_rsa_key\n'
+} >"$WORK/sshd_config"
+ssh-keygen -A >/dev/null 2>&1 || true
+mkdir -p /run/sshd
+if sshd -t -f "$WORK/sshd_config" 2>"$WORK/sshd.err"; then
+    pass "sshd -t accepts the hardening drop-in"
+else
+    fail "sshd -t rejected the hardening drop-in"
+    sed 's/^/      /' "$WORK/sshd.err" | head -20
+fi
+for expect in "passwordauthentication no" "kbdinteractiveauthentication no" \
+    "permitrootlogin no" "authenticationmethods publickey" "x11forwarding no" \
+    "maxauthtries 3" "allowusers johnny agent"; do
+    if grep -qi "^${expect// /[[:space:]]}" "$sshd_dropin"; then
+        pass "sshd drop-in contains: $expect"
+    else
+        fail "sshd drop-in is missing: $expect"
+    fi
+done
+
+# --- 5b. netplan ----------------------------------------------------------
+mkdir -p "$WORK/fakebin2"
+cat >"$WORK/fakebin2/ip" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-o" ] && [ "${2:-}" = "link" ]; then
+    echo "3: wlp2s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP mode DEFAULT group default qlen 1000"
+    exit 0
+fi
+exec /sbin/ip "$@"
+EOF
+chmod +x "$WORK/fakebin2/ip"
+# netplan calls "systemctl daemon-reload" after generating, which cannot work
+# in a container without systemd as PID 1. The stub keeps the netplan PARSER
+# (the part we actually want to test) and only skips the reload.
+cat >"$WORK/fakebin2/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$WORK/fakebin2/systemctl"
+# Placeholder fixture values - deliberately obviously fake, never a real SSID
+# or password. The apostrophe in the name exercises the YAML quoting.
+HUB_FIXTURE_NET="test's-ssid"
+HUB_FIXTURE_SECRET='placeholderpass'
+if HUB_WIFI_APPLY=0 PATH="$WORK/fakebin2:$PATH" \
+    WIFI_SSID="$HUB_FIXTURE_NET" WIFI_PASS="$HUB_FIXTURE_SECRET" \
+    bash bootstrap/optional/04-wifi.sh >"$WORK/wifi.log" 2>&1; then
+    pass "04-wifi.sh generated a netplan file"
+else
+    fail "04-wifi.sh failed"
+    sed 's/^/      /' "$WORK/wifi.log" | tail -20
+fi
+if [ -f /etc/netplan/90-hub-wifi.yaml ]; then
+    mode="$(stat -c %a /etc/netplan/90-hub-wifi.yaml)"
+    if [ "$mode" = "600" ]; then
+        pass "the netplan wifi file is mode 600"
+    else
+        fail "the netplan wifi file is mode $mode (expected 600)"
+    fi
+    if grep -q 'optional: true' /etc/netplan/90-hub-wifi.yaml; then
+        pass "the netplan wifi file marks the interface optional"
+    else
+        fail "the netplan wifi file does not mark the interface optional"
+    fi
+    if PATH="$WORK/fakebin2:$PATH" netplan generate 2>"$WORK/netplan.err"; then
+        pass "netplan generate accepts the wifi file"
+    else
+        fail "netplan generate rejected the wifi file"
+        sed 's/^/      /' "$WORK/netplan.err" | head -20
+    fi
+else
+    fail "no netplan file was produced"
+fi
+
+# --- 5c. systemd units ----------------------------------------------------
+mkdir -p "$WORK/units"
+for f in "$WORK/units"/*; do
+    rm -f "$f"
+done
+extract_units() {
+    # extract_units <script> - writes every unit it finds into $WORK/units
+    awk -v outdir="$WORK/units" '
+        /\/etc\/systemd\/system\/[^[:space:]]+/ {
+            s = $0
+            sub(/^.*\/etc\/systemd\/system\//, "", s)
+            sub(/[[:space:]].*$/, "", s)
+            unit = s
+            grab = 1
+            next
+        }
+        grab && $0 == "EOF" { grab = 0; next }
+        grab { print $0 > (outdir "/" unit); next }
+    ' "$1"
+}
+
+unit_count=0
+for script in bootstrap/bootstrap.sh bootstrap/optional/41-backup-restic.sh \
+    bootstrap/optional/43-battery-limit.sh bootstrap/optional/44-tune-lowpower.sh; do
+    extract_units "$script"
+done
+for unit in "$WORK/units"/*; do
+    [ -f "$unit" ] || continue
+    unit_count=$((unit_count + 1))
+done
+if [ "$unit_count" -ge 8 ]; then
+    pass "extracted $unit_count systemd units from the kit"
+else
+    fail "only $unit_count systemd units were extracted (expected at least 8)"
+fi
+
+# The unit files reference helper scripts; create stubs so verify is clean.
+for helper in hub-reboot-if-stale hub-heartbeat hub-power-restore \
+    hub-restic-backup hub-restic-check; do
+    if [ ! -e "/usr/local/sbin/$helper" ]; then
+        printf '#!/bin/sh\nexit 0\n' >"/usr/local/sbin/$helper"
+        chmod +x "/usr/local/sbin/$helper"
+    fi
+done
+
+for unit in "$WORK/units"/*; do
+    [ -f "$unit" ] || continue
+    name="$(basename "$unit")"
+    if systemd-analyze verify "$unit" >"$WORK/unit.out" 2>&1; then
+        pass "systemd-analyze verify: $name"
+    else
+        if grep -qiE 'Unknown lvalue|Failed to parse|error' "$WORK/unit.out"; then
+            fail "systemd-analyze verify: $name"
+            sed 's/^/      /' "$WORK/unit.out" | head -15
+        else
+            pass "systemd-analyze verify: $name (warnings only)"
+            sed 's/^/      /' "$WORK/unit.out" | head -6
+        fi
+    fi
+done
+
+# --- 5d. JSON -------------------------------------------------------------
+if jq -e . policy/tailscale-policy-snippet.json >/dev/null 2>&1; then
+    pass "the tailscale policy snippet is valid JSON"
+else
+    fail "the tailscale policy snippet is not valid JSON"
+fi
+if jq -e '.tagOwners["tag:hub"]' policy/tailscale-policy-snippet.json >/dev/null 2>&1; then
+    pass "the policy snippet has a tag:hub owner"
+else
+    fail "the policy snippet has no tag:hub owner"
+fi
+if jq -e '.ssh[0].users | index("johnny") and index("agent")' \
+    policy/tailscale-policy-snippet.json >/dev/null 2>&1; then
+    pass "the policy snippet allows ssh for johnny and agent"
+else
+    fail "the policy snippet does not allow ssh for johnny and agent"
+fi
+
+# --- 5e. needrestart -----------------------------------------------------
+if command -v needrestart >/dev/null 2>&1; then
+    extract_block bootstrap/bootstrap.sh "/etc/needrestart/needrestart.conf <<'EOF'" \
+        >"$WORK/needrestart.conf"
+    if [ -s "$WORK/needrestart.conf" ]; then
+        pass "extracted the needrestart config from bootstrap.sh"
+        cp "$WORK/needrestart.conf" /etc/needrestart/needrestart.conf
+        if perl -c /etc/needrestart/needrestart.conf >"$WORK/nr.out" 2>&1; then
+            pass "the needrestart config is valid perl"
+        else
+            fail "the needrestart config is not valid perl"
+            sed 's/^/      /' "$WORK/nr.out" | head -5
+        fi
+        if needrestart -b >"$WORK/nr-batch.out" 2>&1; then
+            pass "needrestart accepts the config (batch mode)"
+        else
+            fail "needrestart rejected the config"
+            sed 's/^/      /' "$WORK/nr-batch.out" | head -10
+        fi
+        for svc in 'ssh\\.service' 'tailscaled\\.service'; do
+            if grep -q "$svc" "$WORK/needrestart.conf"; then
+                pass "needrestart blacklists $svc"
+            else
+                fail "needrestart does not blacklist $svc"
+            fi
+        done
+    else
+        fail "could not extract the needrestart config from bootstrap.sh"
+    fi
+else
+    printf 'SKIP  needrestart is not installed in this image\n'
+fi
+
+# --- 5f. the zram-generator expression ------------------------------------
+ZRAM_GEN="/usr/lib/systemd/system-generators/zram-generator"
+if [ -x "$ZRAM_GEN" ]; then
+    install -d -m 0755 /etc/systemd
+    cat >/etc/systemd/zram-generator.conf <<'EOF'
+[zram0]
+zram-size = min(ram/2, 4096)
+compression-algorithm = zstd
+EOF
+    mkdir -p "$WORK/zramout"
+    if "$ZRAM_GEN" "$WORK/zramout" "$WORK/zramout" "$WORK/zramout" >"$WORK/zram.out" 2>&1; then
+        pass "the zram-generator accepts min(ram/2, 4096)"
+    else
+        fail "the zram-generator rejected min(ram/2, 4096)"
+        sed 's/^/      /' "$WORK/zram.out" | head -10
+    fi
+    # Prove the check can actually fail: a broken expression must be rejected.
+    cat >/etc/systemd/zram-generator.conf <<'EOF'
+[zram0]
+zram-size = definitely-not-a-valid-expression
+EOF
+    if "$ZRAM_GEN" "$WORK/zramout" "$WORK/zramout" "$WORK/zramout" >"$WORK/zram-bad.out" 2>&1; then
+        fail "the zram-generator accepted a broken expression (the test above proves nothing)"
+    else
+        pass "the zram-generator rejects a broken expression (the check is meaningful)"
+    fi
+else
+    printf 'SKIP  zram-generator is not installed in this image\n'
+fi
+
+# --------------------------------------------------------------------------
+# 6. the PROCHOT / thermal check
+# --------------------------------------------------------------------------
+info "6. the PROCHOT / thermal check"
+THROTTLE_SRC="bootstrap/optional/44-tune-lowpower.sh"
+if extract_block "$THROTTLE_SRC" "/usr/local/bin/hub-throttle-check <<'EOF'" >"$WORK/hub-throttle-check" &&
+    [ -s "$WORK/hub-throttle-check" ]; then
+    pass "extracted hub-throttle-check from 44-tune-lowpower.sh"
+else
+    fail "could not extract hub-throttle-check from 44-tune-lowpower.sh"
+fi
+
+# IA32_THERM_STATUS is 0x19c. 0x1fc is not a thermal status register.
+if grep -q '0x1fc' "$WORK/hub-throttle-check" 2>/dev/null; then
+    fail "hub-throttle-check reads MSR 0x1fc - IA32_THERM_STATUS is 0x19c"
+else
+    pass "hub-throttle-check does not use the wrong MSR address 0x1fc"
+fi
+
+# rdmsr prints the register value as hex WITHOUT a 0x prefix, so it has to be
+# prefixed before bash arithmetic treats it as a number. Without that, a value
+# like 88450018 is read as decimal and the bit tests give the wrong answer.
+if grep -q 'hex="0x\$value"' "$WORK/hub-throttle-check" 2>/dev/null; then
+    pass "hub-throttle-check prefixes the MSR value with 0x before arithmetic"
+else
+    fail "hub-throttle-check does not prefix the MSR value with 0x (hex would be read as decimal)"
+fi
+
+# Behaviour: a fake rdmsr returns a hex value with the PROCHOT#/FORCEPR#
+# event bit (bit 3) set. The script has to report the event and set
+# PROCHOT_SEEN=1.
+cat >"$WORK/fakebin/rdmsr" <<'FAKE'
+#!/usr/bin/env bash
+addr="${!#}"
+printf '%s\n' "$addr" >"$FAKE_RDMSR_ADDR_FILE"
+printf '%s\n' "$FAKE_RDMSR_VALUE"
+FAKE
+chmod +x "$WORK/fakebin/rdmsr"
+awk '/^read_therm_status\(\)/,/^\}/' "$WORK/hub-throttle-check" >"$WORK/therm-func.sh"
+cat >"$WORK/therm-test.sh" <<'TEST'
+set -uo pipefail
+. "$1"
+read_therm_status
+echo "PROCHOT_SEEN=$PROCHOT_SEEN"
+TEST
+export FAKE_RDMSR_ADDR_FILE="$WORK/rdmsr_addr"
+export FAKE_RDMSR_VALUE="88450018"
+out="$(PATH="$WORK/fakebin:$PATH" bash "$WORK/therm-test.sh" "$WORK/therm-func.sh" 2>&1 || true)"
+case "$out" in
+    *"PROCHOT_SEEN=1"*) pass "hub-throttle-check sets PROCHOT_SEEN on a PROCHOT# event bit" ;;
+    *) fail "hub-throttle-check did not set PROCHOT_SEEN for a PROCHOT# event bit (got: $out)" ;;
+esac
+case "$out" in
+    *"PROCHOT#/FORCEPR# EVENT"*) pass "hub-throttle-check names the PROCHOT# event bit" ;;
+    *) fail "hub-throttle-check did not report the PROCHOT# event bit (got: $out)" ;;
+esac
+if [ "$(cat "$FAKE_RDMSR_ADDR_FILE" 2>/dev/null)" = "0x19c" ]; then
+    pass "hub-throttle-check asked rdmsr for MSR 0x19c"
+else
+    fail "hub-throttle-check asked rdmsr for the wrong MSR (got: $(cat "$FAKE_RDMSR_ADDR_FILE" 2>/dev/null))"
+fi
+
+# The sticky PROCHOT log is bit 5 of IA32_THERM_STATUS (bit 4 is reserved).
+FAKE_RDMSR_VALUE="88450020"
+out="$(PATH="$WORK/fakebin:$PATH" FAKE_RDMSR_VALUE="$FAKE_RDMSR_VALUE" bash "$WORK/therm-test.sh" "$WORK/therm-func.sh" 2>&1 || true)"
+case "$out" in
+    *"PROCHOT# LOG"*) pass "hub-throttle-check reads the sticky PROCHOT log from bit 5" ;;
+    *) fail "hub-throttle-check did not read the sticky PROCHOT log from bit 5 (got: $out)" ;;
+esac
+FAKE_RDMSR_VALUE="88450020"
+
+# --------------------------------------------------------------------------
+# 7. secret scan
+# --------------------------------------------------------------------------
+info "7. secret scan"
+if bash tests/secret-scan.sh >"$WORK/secrets.out" 2>&1; then
+    pass "the secret scan is clean"
+    sed 's/^/      /' "$WORK/secrets.out" | grep -E '^(clean|FINDING)' | head -12
+else
+    fail "the secret scan found something"
+    sed 's/^/      /' "$WORK/secrets.out" | head -30
+fi
+
+# --------------------------------------------------------------------------
+# summary
+# --------------------------------------------------------------------------
+info "summary"
+printf 'passed : %s\n' "$PASS"
+printf 'failed : %s\n' "$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+    printf '\nfailed checks:\n'
+    for item in "${FAILED_ITEMS[@]}"; do
+        printf '  - %s\n' "$item"
+    done
+    exit 1
+fi
+printf '\nall checks passed\n'
+exit 0

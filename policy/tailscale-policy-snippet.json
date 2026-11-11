@@ -1,0 +1,52 @@
+{
+  "tagOwners": {
+    "tag:hub": [
+      "autogroup:admin"
+    ]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": [
+        "autogroup:admin"
+      ],
+      "dst": [
+        "tag:hub:*"
+      ]
+    }
+  ],
+  "ssh": [
+    {
+      "action": "accept",
+      "src": [
+        "autogroup:admin"
+      ],
+      "dst": [
+        "tag:hub"
+      ],
+      "users": [
+        "johnny",
+        "agent"
+      ]
+    }
+  ],
+  "tests": [
+    {
+      "src": "your-phone@example.com",
+      "accept": [
+        "tag:hub:22",
+        "tag:hub:8096"
+      ],
+      "deny": [
+        "tag:someone-else:22"
+      ]
+    },
+    {
+      "src": "someone-else@example.com",
+      "accept": [],
+      "deny": [
+        "tag:hub:22"
+      ]
+    }
+  ]
+}
