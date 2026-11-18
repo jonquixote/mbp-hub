@@ -140,13 +140,13 @@ set +a
 rm -rf "$TARGET"
 mkdir -p "$TARGET"
 
-latest="$(restic snapshots --json | jq -r 'sort_by(.time) | last | .short_id')"
+latest="$(restic snapshots --tag automatic --json | jq -r 'sort_by(.time) | last | .short_id')"
 if [ -z "$latest" ] || [ "$latest" = "null" ]; then
     echo "no snapshots found in $RESTIC_REPOSITORY" >&2
     exit 1
 fi
 echo "latest snapshot: $latest"
-restic restore "$latest" --target "$TARGET"
+restic restore "$latest" --target "$TARGET" --include /etc/hub
 
 status=0
 checked=0
@@ -254,7 +254,7 @@ if grep -qiE 'SMART overall-health|SMART/Health Information|Available Spare' <<<
 # managed by mbp-hub
 DEVICESCAN -a -o on -S on -W 4,35,55
 EOF
-    systemctl enable --now smartd || warn_log "could not start smartd"
+    systemctl enable --now smartmontools || warn_log "could not start smartd"
     log "smartd enabled with DEVICESCAN"
 else
     warn_log "SMART data is NOT readable on /dev/nvme0 - smartd stays disabled"

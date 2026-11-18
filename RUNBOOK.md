@@ -143,7 +143,7 @@ Plug it into the hub before you start and use it for the installer only.
 | LVM | **No** |
 | Root encryption | **No** (the vault container handles secrets) |
 | Hostname | `mbp-hub` |
-| User | `johnny` with your own strong password (sudo rights) |
+| User | `john` with your own strong password (sudo rights) |
 | Network | the Wi-Fi network, or the Ethernet adapter |
 | Proxy | none |
 | Software selection | "Minimal" / "Standard server" - **no snaps** (uncheck the Snap options; the installer may not offer snaps at all on the server image) |
@@ -159,7 +159,7 @@ Plug it into the hub before you start and use it for the installer only.
 2. `systemd-analyze time` - how long does it take to reach multi-user?
 3. `ip -brief address` - is the network up?
 4. `ping -c1 deb.debian.org` and `getent hosts archive.ubuntu.com` - DNS and routing.
-5. `ssh <your-phone-or-laptop>` -> can you log in as `johnny`?
+5. `ssh <your-phone-or-laptop>` -> can you log in as `john`?
 6. `systemctl --failed` - anything broken?
 7. `journalctl -b -p err` - errors during boot.
 8. Wi-Fi speed check (`iw dev wlp2s0 link` shows the negotiated rate). If it is
@@ -212,8 +212,8 @@ automatically.
 
 ```bash
 sudo vault-open          # you type the passphrase
-ls /vault/johnny         # your SSH keys, API tokens, .env files
-cp /vault/johnny/id_ed25519 ~/.ssh/     # copy what you need out
+ls /vault/john         # your SSH keys, API tokens, .env files
+cp /vault/john/id_ed25519 ~/.ssh/     # copy what you need out
 sudo vault-close         # lock it again
 ```
 
@@ -245,7 +245,7 @@ Every line must be true before you call the hub "done".
 | 6 | **Plug-pull test** | unplug the charger for 10 s, plug it back in | the hub comes back by itself (this is the real test - see KNOWN UNKNOWNS) |
 | 7 | Throttle check | `sudo hub-throttle-check` | record the verdict verbatim: "No PROCHOT observed during the test." **or** "PROCHOT WAS ASSERTED during the test." **or** "UNKNOWN - the MSR could not be read, so no verdict is possible." A PROCHOT verdict must be investigated (battery first), not silently accepted |
 | 8 | Battery reporting | `upower -i $(upower -e \| grep BAT)` | state and percentage, no error |
-| 9 | Vault open | `sudo vault-open` | mounted at /vault, /vault/johnny and /vault/agent present |
+| 9 | Vault open | `sudo vault-open` | mounted at /vault, /vault/john and /vault/agent present |
 | 10 | Vault close | `sudo vault-close` | unmounted, mapper gone, `vault-status` says closed |
 | 11 | Vault is really encrypted | `sudo blkid /var/lib/vault/vault.img` | says `crypto_LUKS` |
 | 12 | Restore test | `sudo hub-restore-test` | "restore test OK" |

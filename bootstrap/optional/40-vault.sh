@@ -85,10 +85,10 @@ if ! blkid -p "/dev/mapper/\$NAME" >/dev/null 2>&1; then
 fi
 
 mount "/dev/mapper/\$NAME" "\$MOUNT"
-mkdir -p "\$MOUNT/johnny" "\$MOUNT/agent"
-chown johnny:johnny "\$MOUNT/johnny"
+mkdir -p "\$MOUNT/john" "\$MOUNT/agent"
+chown john:john "\$MOUNT/john"
 chown agent:agent "\$MOUNT/agent"
-chmod 0700 "\$MOUNT/johnny" "\$MOUNT/agent"
+chmod 0700 "\$MOUNT/john" "\$MOUNT/agent"
 echo "vault open at \$MOUNT"
 df -h "\$MOUNT"
 EOF
@@ -155,7 +155,7 @@ cat <<'EOF'
 
 THE VAULT
   /var/lib/vault/vault.img  LUKS2 container (ext4 inside), mounted at /vault
-  /vault/johnny             owned by johnny
+  /vault/john             owned by john
   /vault/agent              owned by agent
 
   It holds SSH private keys, API tokens and .env files.
@@ -164,7 +164,7 @@ THE VAULT
   Nothing auto-unlocks. Open it when you need the secrets:
 
       sudo vault-open      # you type the passphrase
-      ls /vault/johnny
+      ls /vault/john
       sudo vault-close     # when you are done
 
 EOF

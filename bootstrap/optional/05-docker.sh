@@ -11,7 +11,7 @@
 #
 set -euo pipefail
 
-HUB_USER="${HUB_USER:-${SUDO_USER:-johnny}}"
+HUB_USER="${HUB_USER:-${SUDO_USER:-john}}"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*"; }
 die() { printf '[%s] ERROR: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >&2; exit 1; }

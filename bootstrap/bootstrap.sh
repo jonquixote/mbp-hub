@@ -118,6 +118,7 @@ write_root_file() {
     local tmp
     tmp="$(mktemp)"
     cat >"$tmp"
+    sudo install -d -o root -g root -m 0755 "$(dirname "$path")"
     sudo install -o "$owner" -g "$group" -m "$mode" "$tmp" "$path"
     rm -f "$tmp"
 }
@@ -389,6 +390,7 @@ EOF
         sudo sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
     fi
 
+    sudo install -d -o root -g root -m 0755 /run/sshd
     if sudo sshd -t; then
         sudo systemctl reload ssh || sudo systemctl restart ssh
         log "sshd configuration accepted and reloaded"

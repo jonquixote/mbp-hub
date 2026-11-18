@@ -126,7 +126,7 @@ erase anything** and the acceptance checklist.
 * **check it with the policy tester** in that editor before you rely on it
 * `tagOwners` gives you ownership of `tag:hub`; the ACL lets only
   `autogroup:admin` (your own devices) reach `tag:hub`; the SSH rule allows
-  Tailscale SSH to `tag:hub` for the users `johnny` and `agent`
+  Tailscale SSH to `tag:hub` for the users `john` and `agent`
 * **tagging is one-way**: once a node is tagged `tag:hub` it can only be
   re-tagged by a tag owner, and removing the tag is what you do to take the
   node out of the group. Read the Tailscale docs before you paste it.

@@ -461,7 +461,7 @@ info "5. generated configuration validation"
 # --- 5a. sshd -------------------------------------------------------------
 sshd_dropin="$WORK/10-hub.conf"
 extract_block bootstrap/bootstrap.sh "/etc/ssh/sshd_config.d/10-hub.conf <<EOF" \
-    | sed 's/\$HUB_USER/johnny/' >"$sshd_dropin"
+    | sed 's/\$HUB_USER/john/' >"$sshd_dropin"
 if [ -s "$sshd_dropin" ]; then
     pass "extracted the sshd drop-in from bootstrap.sh"
 else
@@ -484,7 +484,7 @@ else
 fi
 for expect in "passwordauthentication no" "kbdinteractiveauthentication no" \
     "permitrootlogin no" "authenticationmethods publickey" "x11forwarding no" \
-    "maxauthtries 3" "allowusers johnny agent"; do
+    "maxauthtries 3" "allowusers john agent"; do
     if grep -qi "^${expect// /[[:space:]]}" "$sshd_dropin"; then
         pass "sshd drop-in contains: $expect"
     else
@@ -660,11 +660,11 @@ if jq -e '.tagOwners["tag:hub"]' policy/tailscale-policy-snippet.json >/dev/null
 else
     fail "the policy snippet has no tag:hub owner"
 fi
-if jq -e '.ssh[0].users | index("johnny") and index("agent")' \
+if jq -e '.ssh[0].users | index("john") and index("agent")' \
     policy/tailscale-policy-snippet.json >/dev/null 2>&1; then
-    pass "the policy snippet allows ssh for johnny and agent"
+    pass "the policy snippet allows ssh for john and agent"
 else
-    fail "the policy snippet does not allow ssh for johnny and agent"
+    fail "the policy snippet does not allow ssh for john and agent"
 fi
 
 # --- 5e. needrestart -----------------------------------------------------
@@ -988,7 +988,7 @@ build_step_script "$WORK/step_tailscale" step_tailscale
 
 : >"$FAKE_TS_ARGS"
 : >"$WORK/ts-bootstrap.log"
-out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=johnny \
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=john \
     LOG_FILE="$WORK/ts-bootstrap.log" TS_AUTHKEY=tskey-supersecretvalue123 \
     TS_TAG=tag:hub FAKE_TS_ARGS="$FAKE_TS_ARGS" \
     bash "$WORK/step_tailscale" 2>&1 || true)"
@@ -1010,7 +1010,7 @@ else
 fi
 
 : >"$FAKE_TS_ARGS"
-out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=johnny \
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=john \
     LOG_FILE="$WORK/ts-bootstrap.log" TS_AUTHKEY=tskey-supersecretvalue123 \
     TS_TAG=tag:hub FAKE_TS_ARGS="$FAKE_TS_ARGS" FAKE_TS_HELP_TIMEOUT=0 \
     bash "$WORK/step_tailscale" 2>&1 || true)"
@@ -1021,7 +1021,7 @@ else
 fi
 
 : >"$FAKE_TS_ARGS"
-out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=johnny \
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=john \
     LOG_FILE="$WORK/ts-bootstrap.log" TS_AUTHKEY=tskey-supersecretvalue123 \
     TS_TAG=tag:hub FAKE_TS_ARGS="$FAKE_TS_ARGS" FAKE_TS_RC=7 \
     bash "$WORK/step_tailscale" 2>&1 || true)"
@@ -1031,7 +1031,7 @@ case "$out" in
 esac
 
 : >"$FAKE_TS_ARGS"
-out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=johnny \
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=john \
     LOG_FILE="$WORK/ts-bootstrap.log" TS_TAG=tag:hub FAKE_TS_ARGS="$FAKE_TS_ARGS" \
     bash "$WORK/step_tailscale" 2>&1 || true)"
 case "$out" in
@@ -1041,7 +1041,7 @@ esac
 
 # The log file is owned by root, so a normal user cannot append to it with
 # "tee". A log write that fails must NOT be reported as a failed step.
-out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=johnny \
+out="$(PATH="$WORK/fakebin4:$PATH" HUB_HOSTNAME=mbp-hub HUB_USER=john \
     LOG_FILE="$WORK/no-such-dir/hub-bootstrap.log" TS_AUTHKEY=tskey-supersecretvalue123 \
     TS_TAG=tag:hub FAKE_TS_ARGS="$FAKE_TS_ARGS" \
     bash "$WORK/step_tailscale" 2>&1 || true)"
